@@ -5,6 +5,37 @@ import torch.nn.functional as F
 from .miniViT import mViT
 
 
+def risk_density_to_edges(risk_density, min_val, max_val, n_bins):
+    batch_size, n_anchors = risk_density.shape
+    device = risk_density.device
+    dtype = risk_density.dtype
+    anchors = torch.linspace(min_val, max_val, n_anchors, device=device, dtype=dtype)
+    taus = torch.linspace(0.0, 1.0, n_bins + 1, device=device, dtype=dtype)
+    cdf = torch.cumsum(risk_density, dim=1)
+    edges = risk_density.new_empty(batch_size, n_bins + 1)
+    edges[:, 0] = min_val
+    edges[:, -1] = max_val
+
+    for b in range(batch_size):
+        for i in range(1, n_bins):
+            tau = taus[i]
+            right = torch.searchsorted(cdf[b], tau).clamp(0, n_anchors - 1)
+            if right.item() == 0:
+                cdf_left = cdf[b].new_tensor(0.0)
+                anchor_left = anchors[0]
+            else:
+                cdf_left = cdf[b, right - 1]
+                anchor_left = anchors[right - 1]
+            cdf_right = cdf[b, right]
+            alpha = (tau - cdf_left) / (cdf_right - cdf_left).clamp_min(1e-6)
+            edges[b, i] = anchor_left + alpha * (anchors[right] - anchor_left)
+
+    edges, _ = torch.sort(edges, dim=1)
+    edges[:, 0] = min_val
+    edges[:, -1] = max_val
+    return edges
+
+
 class UpSampleBN(nn.Module):
     def __init__(self, skip_input, output_features):
         super(UpSampleBN, self).__init__()
@@ -75,11 +106,17 @@ class Encoder(nn.Module):
 
 
 class UnetAdaptiveBins(nn.Module):
-    def __init__(self, backend, n_bins=100, min_val=0.1, max_val=10, norm='linear'):
+    def __init__(self, backend, n_bins=100, min_val=0.1, max_val=10, norm='linear', bin_mode='adabins',
+                 risk_num_anchors=128, risk_eps=1e-6):
         super(UnetAdaptiveBins, self).__init__()
+        if bin_mode not in ('adabins', 'risk'):
+            raise ValueError("bin_mode must be 'adabins' or 'risk'")
         self.num_classes = n_bins
         self.min_val = min_val
         self.max_val = max_val
+        self.bin_mode = bin_mode
+        self.risk_num_anchors = risk_num_anchors
+        self.risk_eps = risk_eps
         self.encoder = Encoder(backend)
         self.adaptive_bins_layer = mViT(128, n_query_channels=128, patch_size=16,
                                         dim_out=n_bins,
@@ -88,8 +125,11 @@ class UnetAdaptiveBins(nn.Module):
         self.decoder = DecoderBN(num_classes=128)
         self.conv_out = nn.Sequential(nn.Conv2d(128, n_bins, kernel_size=1, stride=1, padding=0),
                                       nn.Softmax(dim=1))
+        self.risk_density_head = None
+        if self.bin_mode == 'risk':
+            self.risk_density_head = nn.Conv2d(128, risk_num_anchors, kernel_size=1, stride=1, padding=0)
 
-    def forward(self, x, **kwargs):
+    def forward(self, x, return_details=False, **kwargs):
         unet_out = self.decoder(self.encoder(x), **kwargs)
         bin_widths_normed, range_attention_maps = self.adaptive_bins_layer(unet_out)
         out = self.conv_out(range_attention_maps)
@@ -98,15 +138,30 @@ class UnetAdaptiveBins(nn.Module):
         # n, c, h, w = out.shape
         # hist = torch.sum(out.view(n, c, h * w), dim=2) / (h * w)  # not used for training
 
-        bin_widths = (self.max_val - self.min_val) * bin_widths_normed  # .shape = N, dim_out
-        bin_widths = nn.functional.pad(bin_widths, (1, 0), mode='constant', value=self.min_val)
-        bin_edges = torch.cumsum(bin_widths, dim=1)
+        risk_density = None
+        if self.bin_mode == 'adabins':
+            bin_widths = (self.max_val - self.min_val) * bin_widths_normed  # .shape = N, dim_out
+            bin_widths = nn.functional.pad(bin_widths, (1, 0), mode='constant', value=self.min_val)
+            bin_edges = torch.cumsum(bin_widths, dim=1)
+        else:
+            risk_logits = self.risk_density_head(unet_out).mean(dim=(2, 3))
+            risk_density = F.softplus(risk_logits) + self.risk_eps
+            risk_density = risk_density / risk_density.sum(dim=1, keepdim=True)
+            bin_edges = risk_density_to_edges(risk_density, self.min_val, self.max_val, self.num_classes)
 
         centers = 0.5 * (bin_edges[:, :-1] + bin_edges[:, 1:])
         n, dout = centers.size()
         centers = centers.view(n, dout, 1, 1)
 
         pred = torch.sum(out * centers, dim=1, keepdim=True)
+
+        if return_details:
+            return {
+                "bin_edges": bin_edges,
+                "pred": pred,
+                "risk_density": risk_density,
+                "bin_widths": bin_edges[:, 1:] - bin_edges[:, :-1]
+            }
 
         return bin_edges, pred
 
@@ -115,6 +170,8 @@ class UnetAdaptiveBins(nn.Module):
 
     def get_10x_lr_params(self):  # lr learning rate
         modules = [self.decoder, self.adaptive_bins_layer, self.conv_out]
+        if self.risk_density_head is not None:
+            modules.append(self.risk_density_head)
         for m in modules:
             yield from m.parameters()
 

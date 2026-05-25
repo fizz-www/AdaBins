@@ -71,7 +71,8 @@ def main_worker(gpu, ngpus_per_node, args):
     ###################################### Load model ##############################################
 
     model = models.UnetAdaptiveBins.build(n_bins=args.n_bins, min_val=args.min_depth, max_val=args.max_depth,
-                                          norm=args.norm)
+                                          norm=args.norm, bin_mode=args.bin_mode,
+                                          risk_num_anchors=args.risk_num_anchors)
 
     ################################################################################################
 
@@ -184,7 +185,11 @@ def train(model, args, epochs=10, experiment_name="DeepLab", lr=0.0001, root="."
                 if not batch['has_valid_depth']:
                     continue
 
-            bin_edges, pred = model(img)
+            outputs = model(img, return_details=True)
+            bin_edges = outputs["bin_edges"]
+            pred = outputs["pred"]
+            bin_widths = outputs["bin_widths"]
+            risk_density = outputs["risk_density"]
 
             mask = depth > args.min_depth
             l_dense = criterion_ueff(pred, depth, mask=mask.to(torch.bool), interpolate=True)
@@ -200,7 +205,20 @@ def train(model, args, epochs=10, experiment_name="DeepLab", lr=0.0001, root="."
             optimizer.step()
             if should_log and step % 5 == 0:
                 wandb.log({f"Train/{criterion_ueff.name}": l_dense.item()}, step=step)
-                wandb.log({f"Train/{criterion_bins.name}": l_chamfer.item()}, step=step)
+                if criterion_bins is not None:
+                    wandb.log({f"Train/{criterion_bins.name}": l_chamfer.item()}, step=step)
+                wandb.log({
+                    "Train/bin_width_min": bin_widths.min().item(),
+                    "Train/bin_width_max": bin_widths.max().item(),
+                    "Train/bin_width_mean": bin_widths.mean().item()
+                }, step=step)
+                if args.bin_mode == 'risk' and risk_density is not None:
+                    risk_entropy = -(risk_density * torch.log(risk_density.clamp_min(1e-12))).sum(dim=1).mean()
+                    wandb.log({
+                        "Train/risk_density_min": risk_density.min().item(),
+                        "Train/risk_density_max": risk_density.max().item(),
+                        "Train/risk_entropy": risk_entropy.item()
+                    }, step=step)
 
             step += 1
             scheduler.step()
@@ -312,6 +330,10 @@ if __name__ == '__main__':
     parser.add_argument("--name", default="UnetAdaptiveBins")
     parser.add_argument("--norm", default="linear", type=str, help="Type of norm/competition for bin-widths",
                         choices=['linear', 'softmax', 'sigmoid'])
+    parser.add_argument("--bin_mode", "--bin-mode", default="adabins", type=str, choices=['adabins', 'risk'],
+                        help="bin edge generation mode")
+    parser.add_argument("--risk_num_anchors", "--risk-num-anchors", default=128, type=int,
+                        help="number of anchors for risk density inverse-CDF bins")
     parser.add_argument("--same-lr", '--same_lr', default=False, action="store_true",
                         help="Use same LR for all param groups")
     parser.add_argument("--distributed", default=True, action="store_true", help="Use DDP if set")
@@ -362,9 +384,9 @@ if __name__ == '__main__':
                         action='store_true')
     parser.add_argument('--garg_crop', help='if set, crops according to Garg  ECCV16', action='store_true')
 
-    if sys.argv.__len__() == 2:
+    if sys.argv.__len__() >= 2 and not sys.argv[1].startswith('-') and os.path.isfile(sys.argv[1]):
         arg_filename_with_prefix = '@' + sys.argv[1]
-        args = parser.parse_args([arg_filename_with_prefix])
+        args = parser.parse_args([arg_filename_with_prefix] + sys.argv[2:])
     else:
         args = parser.parse_args()
 
